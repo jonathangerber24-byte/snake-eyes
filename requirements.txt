@@ -3,3 +3,4 @@ pandas
 bcrypt
 requests
 reportlab
+psycopg2-binary
