@@ -2,7 +2,9 @@ import streamlit as st
 import pandas as pd
 from datetime import date
 import io
-import sqlite3
+import psycopg2
+import psycopg2.extras
+from psycopg2 import IntegrityError as DBIntegrityError
 import bcrypt
 import json
 import requests
@@ -11,55 +13,115 @@ from pathlib import Path
 
 st.set_page_config(page_title="Snake Eyes // D-backs Pitch Intel",page_icon="⚾",layout="wide",initial_sidebar_state="expanded")
 
-DB_PATH = Path.home() / "snake_eyes.db"
+def get_db():
+    # Use Streamlit secrets in production, fallback to SQLite locally
+    try:
+        db_url = st.secrets["DATABASE_URL"]
+        conn = psycopg2.connect(db_url)
+        conn.autocommit = False
+        return conn, "pg"
+    except Exception:
+        import sqlite3
+        conn = sqlite3.connect(str(Path.home() / "snake_eyes.db"))
+        conn.row_factory = sqlite3.Row
+        return conn, "sqlite"
 
 def get_db():
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        db_url = st.secrets["DATABASE_URL"]
+        conn = psycopg2.connect(db_url, cursor_factory=psycopg2.extras.RealDictCursor)
+        return conn, "pg"
+    except Exception:
+        import sqlite3
+        conn = sqlite3.connect(str(Path.home() / "snake_eyes.db"))
+        conn.row_factory = sqlite3.Row
+        return conn, "sqlite"
+
+def ph(db_type, n=1):
+    """Return correct placeholder — %s for pg, ? for sqlite."""
+    return ",".join(["%s" if db_type=="pg" else "?"]*n)
+
+def execute(conn, db_type, sql, params=()):
+    sql_conv = sql if db_type=="pg" else sql.replace("%s","?")
+    cur = conn.cursor()
+    cur.execute(sql_conv, params)
+    return cur
+
+def fetchall(conn, db_type, sql, params=()):
+    cur = execute(conn, db_type, sql, params)
+    rows = cur.fetchall()
+    return [dict(r) for r in rows]
+
+def fetchone(conn, db_type, sql, params=()):
+    cur = execute(conn, db_type, sql, params)
+    row = cur.fetchone()
+    return dict(row) if row else None
 
 def init_db():
-    conn = get_db(); c = conn.cursor()
-    c.execute("""CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT,username TEXT UNIQUE NOT NULL,display_name TEXT NOT NULL,password_hash TEXT NOT NULL,role TEXT NOT NULL DEFAULT 'Scout',default_level TEXT DEFAULT 'AAA',created_at TEXT DEFAULT (date('now')))""")
-    c.execute("""CREATE TABLE IF NOT EXISTS tips (id INTEGER PRIMARY KEY AUTOINCREMENT,mlb_player_id INTEGER,name TEXT NOT NULL,jersey_number TEXT,hand TEXT NOT NULL,opponent TEXT NOT NULL,level TEXT NOT NULL,tip_view TEXT NOT NULL,internal INTEGER NOT NULL DEFAULT 0,pitch TEXT NOT NULL,tell_type TEXT NOT NULL,tell TEXT NOT NULL,vantage TEXT,confidence TEXT NOT NULL,games INTEGER NOT NULL DEFAULT 1,tags TEXT,status TEXT NOT NULL DEFAULT 'pending',submitted_by TEXT NOT NULL,submitted_by_display TEXT NOT NULL,date_added TEXT NOT NULL,clips TEXT NOT NULL DEFAULT '[]',history TEXT NOT NULL DEFAULT '[]')""")
-    c.execute("""CREATE TABLE IF NOT EXISTS opponents (id INTEGER PRIMARY KEY AUTOINCREMENT,level TEXT NOT NULL,name TEXT NOT NULL,UNIQUE(level,name))""")
-    c.execute("""CREATE TABLE IF NOT EXISTS team_requests (id INTEGER PRIMARY KEY AUTOINCREMENT,level TEXT NOT NULL,team_name TEXT NOT NULL,requested_by TEXT NOT NULL,requested_by_display TEXT NOT NULL,date_requested TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending',mlb_player_id INTEGER,player_name TEXT)""")
-    c.execute("SELECT COUNT(*) FROM users")
-    if c.fetchone()[0] == 0:
+    conn, db = get_db()
+    serial = "SERIAL" if db=="pg" else "INTEGER"
+    auto   = "" if db=="pg" else "AUTOINCREMENT"
+    pk     = f"{serial} PRIMARY KEY" if db=="pg" else f"INTEGER PRIMARY KEY {auto}"
+    today_fn = "CURRENT_DATE" if db=="pg" else "date('now')"
+    execute(conn, db, f"""CREATE TABLE IF NOT EXISTS users (
+        id {pk}, username TEXT UNIQUE NOT NULL, display_name TEXT NOT NULL,
+        password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'Scout',
+        default_level TEXT DEFAULT 'AAA', created_at TEXT DEFAULT ({today_fn}))""")
+    execute(conn, db, f"""CREATE TABLE IF NOT EXISTS tips (
+        id {pk}, mlb_player_id INTEGER, name TEXT NOT NULL, jersey_number TEXT,
+        hand TEXT NOT NULL, opponent TEXT NOT NULL, level TEXT NOT NULL,
+        tip_view TEXT NOT NULL, internal INTEGER NOT NULL DEFAULT 0,
+        pitch TEXT NOT NULL, tell_type TEXT NOT NULL, tell TEXT NOT NULL,
+        vantage TEXT, confidence TEXT NOT NULL, games INTEGER NOT NULL DEFAULT 1,
+        tags TEXT, status TEXT NOT NULL DEFAULT 'pending',
+        submitted_by TEXT NOT NULL, submitted_by_display TEXT NOT NULL,
+        date_added TEXT NOT NULL, clips TEXT NOT NULL DEFAULT '[]',
+        history TEXT NOT NULL DEFAULT '[]')""")
+    execute(conn, db, f"""CREATE TABLE IF NOT EXISTS opponents (
+        id {pk}, level TEXT NOT NULL, name TEXT NOT NULL, UNIQUE(level,name))""")
+    execute(conn, db, f"""CREATE TABLE IF NOT EXISTS team_requests (
+        id {pk}, level TEXT NOT NULL, team_name TEXT NOT NULL,
+        requested_by TEXT NOT NULL, requested_by_display TEXT NOT NULL,
+        date_requested TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+        mlb_player_id INTEGER, player_name TEXT)""")
+    row = fetchone(conn, db, "SELECT COUNT(*) as cnt FROM users")
+    if row["cnt"] == 0:
         pw = bcrypt.hashpw("admin123".encode(), bcrypt.gensalt()).decode()
-        c.execute("INSERT INTO users (username,display_name,password_hash,role,default_level) VALUES (?,?,?,?,?)",("admin","Jon Gerber",pw,"Admin","AAA"))
-    c.execute("SELECT COUNT(*) FROM opponents")
-    if c.fetchone()[0] == 0:
+        execute(conn, db, "INSERT INTO users (username,display_name,password_hash,role,default_level) VALUES (%s,%s,%s,%s,%s)",
+                ("admin","Jon Gerber",pw,"Admin","AAA"))
+    row = fetchone(conn, db, "SELECT COUNT(*) as cnt FROM opponents")
+    if row["cnt"] == 0:
         dops={"MLB":["Atlanta Braves","Baltimore Orioles","Boston Red Sox","Chicago Cubs","Chicago White Sox","Cincinnati Reds","Cleveland Guardians","Colorado Rockies","Detroit Tigers","Houston Astros","Kansas City Royals","Los Angeles Angels","Los Angeles Dodgers","Miami Marlins","Milwaukee Brewers","Minnesota Twins","New York Mets","New York Yankees","Oakland Athletics","Philadelphia Phillies","Pittsburgh Pirates","San Diego Padres","San Francisco Giants","Seattle Mariners","St. Louis Cardinals","Tampa Bay Rays","Texas Rangers","Toronto Blue Jays","Washington Nationals"],"AAA":["Albuquerque Isotopes (COL)","El Paso Chihuahuas (SD)","Las Vegas Aviators (OAK)","Oklahoma City Comets (LAD)","Round Rock Express (TEX)","Sacramento River Cats (SF)","Salt Lake Bees (LAA)","Sugar Land Space Cowboys (HOU)","Tacoma Rainiers (SEA)"],"AA":["Arkansas Travelers (SEA)","Corpus Christi Hooks (HOU)","Frisco RoughRiders (TEX)","Midland RockHounds (OAK)","NW Arkansas Naturals (KC)","San Antonio Missions (SD)","Springfield Cardinals (STL)","Tulsa Drillers (LAD)","Wichita Wind Surge (MIN)"],"A+":["Eugene Emeralds (SF)","Everett AquaSox (SEA)","Spokane Indians (COL)","Tri-City Dust Devils (LAA)","Vancouver Canadians (TOR)"],"A":["Fresno Grizzlies (COL)","Lake Elsinore Storm (SD)","Ontario Tower Buzzers (SEA)","Rancho Cucamonga Quakes (LAA)","San Bernardino IE 66ers (SEA)","San Jose Giants (SF)","Stockton Ports (OAK)"],"ACL":["ACL Angels","ACL Astros","ACL Athletics","ACL Blue Jays","ACL Brewers","ACL Cardinals","ACL Cubs","ACL Dodgers","ACL Giants","ACL Guardians","ACL Mariners","ACL Padres","ACL Rangers","ACL Rays","ACL Red Sox","ACL Rockies","ACL Royals","ACL Tigers","ACL Twins","ACL White Sox","ACL Yankees"]}
         for lvl,opps in dops.items():
-            for opp in opps: c.execute("INSERT OR IGNORE INTO opponents (level,name) VALUES (?,?)",(lvl,opp))
+            for opp in opps:
+                try: execute(conn, db, "INSERT INTO opponents (level,name) VALUES (%s,%s)",(lvl,opp))
+                except: pass
     conn.commit(); conn.close()
 
 init_db()
 
 def get_db_tips(level=None,opponent=None,tip_view=None,internal=None,status=None,name=None):
-    conn=get_db(); q="SELECT * FROM tips WHERE 1=1"; p=[]
-    if level:    q+=" AND level=?";    p.append(level)
-    if opponent: q+=" AND opponent=?"; p.append(opponent)
-    if tip_view: q+=" AND tip_view=?"; p.append(tip_view)
-    if internal is not None: q+=" AND internal=?"; p.append(1 if internal else 0)
-    if status:   q+=" AND status=?";   p.append(status)
-    if name:     q+=" AND LOWER(name)=?"; p.append(name.lower())
+    conn,db=get_db(); q="SELECT * FROM tips WHERE 1=1"; p=[]
+    if level:    q+=" AND level=%s";    p.append(level)
+    if opponent: q+=" AND opponent=%s"; p.append(opponent)
+    if tip_view: q+=" AND tip_view=%s"; p.append(tip_view)
+    if internal is not None: q+=" AND internal=%s"; p.append(1 if internal else 0)
+    if status:   q+=" AND status=%s";   p.append(status)
+    if name:     q+=" AND LOWER(name)=%s"; p.append(name.lower())
     q+=" ORDER BY date_added DESC"
-    rows=conn.execute(q,p).fetchall(); conn.close()
-    out=[]
-    for r in rows:
-        d=dict(r); d["clips"]=json.loads(d["clips"]); d["history"]=json.loads(d["history"]); d["internal"]=bool(d["internal"]); out.append(d)
-    return out
+    rows=fetchall(conn,db,q,p); conn.close()
+    for d in rows:
+        d["clips"]=json.loads(d["clips"] or "[]"); d["history"]=json.loads(d["history"] or "[]"); d["internal"]=bool(d["internal"])
+    return rows
 
 def get_db_tip(tid):
-    conn=get_db(); row=conn.execute("SELECT * FROM tips WHERE id=?",(tid,)).fetchone(); conn.close()
+    conn,db=get_db(); row=fetchone(conn,db,"SELECT * FROM tips WHERE id=%s",(tid,)); conn.close()
     if not row: return None
-    d=dict(row); d["clips"]=json.loads(d["clips"]); d["history"]=json.loads(d["history"]); d["internal"]=bool(d["internal"]); return d
+    row["clips"]=json.loads(row["clips"] or "[]"); row["history"]=json.loads(row["history"] or "[]"); row["internal"]=bool(row["internal"]); return row
 
 def add_db_tip(tip):
-    conn=get_db()
-    conn.execute("""INSERT INTO tips (mlb_player_id,name,jersey_number,hand,opponent,level,tip_view,internal,pitch,tell_type,tell,vantage,confidence,games,tags,status,submitted_by,submitted_by_display,date_added,clips,history) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+    conn,db=get_db()
+    execute(conn,db,"INSERT INTO tips (mlb_player_id,name,jersey_number,hand,opponent,level,tip_view,internal,pitch,tell_type,tell,vantage,confidence,games,tags,status,submitted_by,submitted_by_display,date_added,clips,history) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
         (tip.get("mlb_player_id"),tip["name"],tip.get("jersey_number",""),tip["hand"],tip["opponent"],tip["level"],tip["tip_view"],1 if tip.get("internal") else 0,tip["pitch"],tip["tell_type"],tip["tell"],tip.get("vantage",""),tip["confidence"],tip["games"],tip.get("tags",""),tip.get("status","pending"),tip["submitted_by"],tip["submitted_by_display"],tip["date_added"],json.dumps(tip.get("clips",[])),json.dumps(tip.get("history",[]))))
     conn.commit(); conn.close()
 
@@ -67,55 +129,60 @@ def update_db_tip(tid,fields):
     if "clips"   in fields: fields["clips"]  =json.dumps(fields["clips"])
     if "history" in fields: fields["history"]=json.dumps(fields["history"])
     if "internal" in fields: fields["internal"]=1 if fields["internal"] else 0
-    conn=get_db(); conn.execute(f"UPDATE tips SET {', '.join(f'{k}=?' for k in fields)} WHERE id=?",list(fields.values())+[tid]); conn.commit(); conn.close()
+    conn,db=get_db()
+    set_clause=", ".join(f"{k}=%s" for k in fields)
+    execute(conn,db,f"UPDATE tips SET {set_clause} WHERE id=%s",list(fields.values())+[tid])
+    conn.commit(); conn.close()
 
 def get_db_opponents(level=None):
-    conn=get_db()
-    rows=conn.execute("SELECT name FROM opponents WHERE level=? ORDER BY name",(level,)).fetchall() if level else conn.execute("SELECT level,name FROM opponents ORDER BY level,name").fetchall()
-    conn.close(); return [dict(r) for r in rows]
+    conn,db=get_db()
+    rows=fetchall(conn,db,"SELECT name FROM opponents WHERE level=%s ORDER BY name",(level,)) if level else fetchall(conn,db,"SELECT level,name FROM opponents ORDER BY level,name")
+    conn.close(); return rows
 
 def add_db_opponent(level,name):
-    conn=get_db()
-    try: conn.execute("INSERT INTO opponents (level,name) VALUES (?,?)",(level,name)); conn.commit(); conn.close(); return True
-    except sqlite3.IntegrityError: conn.close(); return False
+    conn,db=get_db()
+    try: execute(conn,db,"INSERT INTO opponents (level,name) VALUES (%s,%s)",(level,name)); conn.commit(); conn.close(); return True
+    except: conn.close(); return False
 
 def del_db_opponent(level,name):
-    conn=get_db(); conn.execute("DELETE FROM opponents WHERE level=? AND name=?",(level,name)); conn.commit(); conn.close()
+    conn,db=get_db(); execute(conn,db,"DELETE FROM opponents WHERE level=%s AND name=%s",(level,name)); conn.commit(); conn.close()
 
 def get_db_users():
-    conn=get_db(); rows=conn.execute("SELECT id,username,display_name,role,default_level,created_at FROM users ORDER BY id").fetchall(); conn.close(); return [dict(r) for r in rows]
+    conn,db=get_db(); rows=fetchall(conn,db,"SELECT id,username,display_name,role,default_level,created_at FROM users ORDER BY id"); conn.close(); return rows
 
 def add_db_user(username,display_name,password,role,default_level):
     pw_hash=bcrypt.hashpw(password.encode(),bcrypt.gensalt()).decode()
-    conn=get_db()
-    try: conn.execute("INSERT INTO users (username,display_name,password_hash,role,default_level) VALUES (?,?,?,?,?)",(username.lower().strip(),display_name.strip(),pw_hash,role,default_level)); conn.commit(); conn.close(); return True,"User created."
-    except sqlite3.IntegrityError: conn.close(); return False,"Username already exists."
+    conn,db=get_db()
+    try: execute(conn,db,"INSERT INTO users (username,display_name,password_hash,role,default_level) VALUES (%s,%s,%s,%s,%s)",(username.lower().strip(),display_name.strip(),pw_hash,role,default_level)); conn.commit(); conn.close(); return True,"User created."
+    except: conn.close(); return False,"Username already exists."
 
 def update_db_user(uid,display_name,role,default_level):
-    conn=get_db(); conn.execute("UPDATE users SET display_name=?,role=?,default_level=? WHERE id=?",(display_name.strip(),role,default_level,uid)); conn.commit(); conn.close()
+    conn,db=get_db(); execute(conn,db,"UPDATE users SET display_name=%s,role=%s,default_level=%s WHERE id=%s",(display_name.strip(),role,default_level,uid)); conn.commit(); conn.close()
 
 def del_db_user(uid):
-    conn=get_db(); conn.execute("DELETE FROM users WHERE id=?",(uid,)); conn.commit(); conn.close()
+    conn,db=get_db(); execute(conn,db,"DELETE FROM users WHERE id=%s",(uid,)); conn.commit(); conn.close()
 
 def check_db_login(username,password):
-    conn=get_db(); row=conn.execute("SELECT * FROM users WHERE username=?",(username.lower().strip(),)).fetchone(); conn.close()
+    conn,db=get_db(); row=fetchone(conn,db,"SELECT * FROM users WHERE username=%s",(username.lower().strip(),)); conn.close()
     if not row: return None
-    return dict(row) if bcrypt.checkpw(password.encode(),row["password_hash"].encode()) else None
+    return row if bcrypt.checkpw(password.encode(),row["password_hash"].encode()) else None
 
 def update_db_password(uid,new_password):
     pw_hash=bcrypt.hashpw(new_password.encode(),bcrypt.gensalt()).decode()
-    conn=get_db(); conn.execute("UPDATE users SET password_hash=? WHERE id=?",(pw_hash,uid)); conn.commit(); conn.close()
+    conn,db=get_db(); execute(conn,db,"UPDATE users SET password_hash=%s WHERE id=%s",(pw_hash,uid)); conn.commit(); conn.close()
 
 def get_team_requests(status=None):
-    conn=get_db(); q="SELECT * FROM team_requests"+(f" WHERE status='{status}'" if status else "")+" ORDER BY date_requested DESC"
-    rows=conn.execute(q).fetchall(); conn.close(); return [dict(r) for r in rows]
+    conn,db=get_db()
+    q="SELECT * FROM team_requests"+(f" WHERE status=%s" if status else "")+" ORDER BY date_requested DESC"
+    rows=fetchall(conn,db,q,(status,) if status else ()); conn.close(); return rows
 
 def add_team_request(level,team_name,req_by,req_by_display,pid,pname):
-    conn=get_db(); conn.execute("INSERT INTO team_requests (level,team_name,requested_by,requested_by_display,date_requested,status,mlb_player_id,player_name) VALUES (?,?,?,?,?,?,?,?)",(level,team_name,req_by,req_by_display,str(date.today()),"pending",pid,pname)); conn.commit(); conn.close()
+    conn,db=get_db(); execute(conn,db,"INSERT INTO team_requests (level,team_name,requested_by,requested_by_display,date_requested,status,mlb_player_id,player_name) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",(level,team_name,req_by,req_by_display,str(date.today()),"pending",pid,pname)); conn.commit(); conn.close()
 
 def resolve_team_request(rid,approve,level,team_name):
-    conn=get_db(); conn.execute("UPDATE team_requests SET status=? WHERE id=?",("approved" if approve else "rejected",rid)); conn.commit(); conn.close()
+    conn,db=get_db(); execute(conn,db,"UPDATE team_requests SET status=%s WHERE id=%s",("approved" if approve else "rejected",rid)); conn.commit(); conn.close()
     if approve: add_db_opponent(level,team_name)
+
 
 def search_mlb_players(query):
     try:
@@ -720,11 +787,10 @@ elif page=="add_tip":
                         lbl=mc2.text_input("Label",placeholder="e.g. BB — tell present",key=f"mlbl_{idx}",label_visibility="collapsed")
                         media_entries.append({"clip_type":"video","source":src,"url":url,"label":lbl,"data":None})
                     else:
-                        uploaded=mc2.file_uploader("Upload image",type=["jpg","jpeg","png","gif"],key=f"mfile_{idx}")
-                        img_url=mc2.text_input("Or paste image URL",placeholder="https://…",key=f"mimgurl_{idx}")
+                        uploaded=mc2.file_uploader("Drag & drop or click to upload image",type=["jpg","jpeg","png","gif"],key=f"mfile_{idx}")
                         lbl=mc2.text_input("Label",placeholder="e.g. Glove position — tell present",key=f"mimlbl_{idx}",label_visibility="collapsed")
                         img_data=base64.b64encode(uploaded.read()).decode() if uploaded else None
-                        media_entries.append({"clip_type":"image","source":"upload","url":img_url,"label":lbl,"data":img_data})
+                        media_entries.append({"clip_type":"image","source":"upload","url":"","label":lbl,"data":img_data})
                     st.markdown('</div>',unsafe_allow_html=True)
 
                 c7,c8=st.columns(2)
@@ -871,11 +937,10 @@ elif page=="search":
     st.markdown('<div style="font-size:20px;font-weight:600;color:#1a1410;margin-bottom:4px;">Search</div>',unsafe_allow_html=True)
     query=st.text_input("Search",placeholder="Pitcher name, tell type, opponent, pitch…",key="sq")
     if query and len(query)>=2:
-        conn=get_db(); q=f"%{query.lower()}%"
-        rows=conn.execute("SELECT * FROM tips WHERE LOWER(name) LIKE ? OR LOWER(tell) LIKE ? OR LOWER(opponent) LIKE ? OR LOWER(tell_type) LIKE ? OR LOWER(pitch) LIKE ? OR LOWER(tags) LIKE ? ORDER BY date_added DESC",(q,q,q,q,q,q)).fetchall(); conn.close()
-        results=[]
-        for r in rows:
-            d=dict(r); d["clips"]=json.loads(d["clips"]); d["history"]=json.loads(d["history"]); d["internal"]=bool(d["internal"]); results.append(d)
+        conn,db=get_db(); q=f"%{query.lower()}%"
+        results=fetchall(conn,db,"SELECT * FROM tips WHERE LOWER(name) LIKE %s OR LOWER(tell) LIKE %s OR LOWER(opponent) LIKE %s OR LOWER(tell_type) LIKE %s OR LOWER(pitch) LIKE %s OR LOWER(tags) LIKE %s ORDER BY date_added DESC",(q,q,q,q,q,q)); conn.close()
+        for d in results:
+            d["clips"]=json.loads(d["clips"] or "[]"); d["history"]=json.loads(d["history"] or "[]"); d["internal"]=bool(d["internal"])
         if not results: st.info("No results found.")
         else:
             st.markdown(f'<div class="section-title">// {len(results)} result{"s" if len(results)!=1 else ""}</div>',unsafe_allow_html=True)
@@ -899,20 +964,19 @@ elif page=="all_tips":
     fc=c4.selectbox("C",["All Confidence","High","Medium","Low"],label_visibility="collapsed")
     fp=c5.selectbox("P",["All Pitches","Breaking ball","Fastball","Changeup","Curveball","Splitter","Cutter"],label_visibility="collapsed")
     fs=c6.selectbox("St",["Active Only","All","Pending Only","Inactive"],label_visibility="collapsed")
-    conn=get_db(); q="SELECT * FROM tips WHERE 1=1"; params=[]
+    conn,db=get_db(); q="SELECT * FROM tips WHERE 1=1"; params=[]
     if fs=="Active Only":   q+=" AND status='active'"
     if fs=="Pending Only":  q+=" AND status='pending'"
     if fs=="Inactive":      q+=" AND status='inactive'"
-    if fl!="All Levels":    q+=" AND level=?"; params.append(fl)
-    if fv!="All Views":     q+=" AND tip_view=?"; params.append(fv)
-    if fc!="All Confidence":q+=" AND confidence=?"; params.append(fc)
-    if fp!="All Pitches":   q+=" AND pitch=?"; params.append(fp)
-    if srch: s=f"%{srch.lower()}%"; q+=" AND (LOWER(name) LIKE ? OR LOWER(tell) LIKE ? OR LOWER(opponent) LIKE ?)"; params+=[s,s,s]
+    if fl!="All Levels":    q+=" AND level=%s"; params.append(fl)
+    if fv!="All Views":     q+=" AND tip_view=%s"; params.append(fv)
+    if fc!="All Confidence":q+=" AND confidence=%s"; params.append(fc)
+    if fp!="All Pitches":   q+=" AND pitch=%s"; params.append(fp)
+    if srch: s=f"%{srch.lower()}%"; q+=" AND (LOWER(name) LIKE %s OR LOWER(tell) LIKE %s OR LOWER(opponent) LIKE %s)"; params+=[s,s,s]
     q+=" ORDER BY date_added DESC"
-    rows=conn.execute(q,params).fetchall(); conn.close()
-    tips=[]
-    for r in rows:
-        d=dict(r); d["clips"]=json.loads(d["clips"]); d["history"]=json.loads(d["history"]); d["internal"]=bool(d["internal"]); tips.append(d)
+    tips=fetchall(conn,db,q,params); conn.close()
+    for d in tips:
+        d["clips"]=json.loads(d["clips"] or "[]"); d["history"]=json.loads(d["history"] or "[]"); d["internal"]=bool(d["internal"])
     if not tips: st.info("No tips match your filters.")
     else:
         for tip in tips:
@@ -934,15 +998,14 @@ elif page=="account":
     at1,at2=st.tabs(["My Submitted Tips","Change Password"])
     with at1:
         sf=st.selectbox("Filter by status",["All","Active","Pending","Inactive"],key="acc_status")
-        conn=get_db(); q="SELECT * FROM tips WHERE submitted_by=?"; params=[user["username"]]
+        conn,db=get_db(); q="SELECT * FROM tips WHERE submitted_by=%s"; params=[user["username"]]
         if sf=="Active":   q+=" AND status='active'"
         if sf=="Pending":  q+=" AND status='pending'"
         if sf=="Inactive": q+=" AND status='inactive'"
         q+=" ORDER BY date_added DESC"
-        rows=conn.execute(q,params).fetchall(); conn.close()
-        mt=[]
-        for r in rows:
-            d=dict(r); d["clips"]=json.loads(d["clips"]); d["history"]=json.loads(d["history"]); d["internal"]=bool(d["internal"]); mt.append(d)
+        mt=fetchall(conn,db,q,params); conn.close()
+        for d in mt:
+            d["clips"]=json.loads(d["clips"] or "[]"); d["history"]=json.loads(d["history"] or "[]"); d["internal"]=bool(d["internal"])
         if not mt: st.markdown('<div class="empty-tab"><div style="font-size:14px;color:#7a6a58;">No tips submitted yet</div></div>',unsafe_allow_html=True)
         else:
             st.markdown(f'<div style="font-size:12px;color:#7a6a58;font-family:monospace;margin-bottom:12px;">{len(mt)} tip{"s" if len(mt)!=1 else ""} found</div>',unsafe_allow_html=True)
