@@ -765,6 +765,29 @@ elif page=="add_tip":
         if not is_internal and not matched_opp and not is_admin():
             st.info("Submit a team request above. Tip submission is paused until the team is approved.")
         else:
+            # Media section OUTSIDE form so radio toggles work live
+            st.markdown("---")
+            st.markdown("**Media** — add video clips and/or still images")
+            media_entries=[]
+            for idx,row in enumerate(st.session_state.media_rows):
+                st.markdown(f'<div class="media-slot">',unsafe_allow_html=True)
+                mc1,mc2=st.columns([2,5])
+                mtype=mc1.radio("Type",["Video","Image"],horizontal=True,key=f"mtype_{idx}")
+                if mtype=="Video":
+                    mc3,mc4=mc2.columns([2,4])
+                    src=mc3.selectbox("Source",["PitchBase","TruMedia","Other"],key=f"msrc_{idx}")
+                    url=mc4.text_input("URL",placeholder="https://…",key=f"murl_{idx}")
+                    lbl=mc2.text_input("Label",placeholder="e.g. BB — tell present",key=f"mlbl_{idx}",label_visibility="collapsed")
+                    media_entries.append({"clip_type":"video","source":src,"url":url,"label":lbl,"data":None})
+                else:
+                    uploaded=mc2.file_uploader("Drag & drop or click to upload image",type=["jpg","jpeg","png","gif"],key=f"mfile_{idx}")
+                    lbl=mc2.text_input("Label",placeholder="e.g. Glove position — tell present",key=f"mimlbl_{idx}",label_visibility="collapsed")
+                    img_data=base64.b64encode(uploaded.read()).decode() if uploaded else None
+                    media_entries.append({"clip_type":"image","source":"upload","url":"","label":lbl,"data":img_data})
+                st.markdown('</div>',unsafe_allow_html=True)
+            if st.button("+ Add Media",key="add_media_btn"): st.session_state.media_rows.append({"type":"video"}); st.rerun()
+            st.markdown("---")
+
             with st.form("atf"):
                 tv=st.selectbox("Tip View *",TIP_VIEWS)
                 c5,c6=st.columns(2)
@@ -772,37 +795,11 @@ elif page=="add_tip":
                 tell_type=c6.selectbox("Tell Category",["Glove position","Arm slot","Timing / tempo","Grip / hand","Eye / head","Catcher setup","Footwork","Other"])
                 tell=st.text_area("Describe the Tell *",placeholder="Be specific enough that a hitter can act on it.",height=100)
                 vantage=st.text_input("Best Vantage Point",placeholder="e.g. 1B dugout, CF camera")
-                st.markdown("---")
-                st.markdown("**Media** — add video clips and/or still images")
-
-                media_entries=[]
-                for idx,row in enumerate(st.session_state.media_rows):
-                    st.markdown(f'<div class="media-slot">',unsafe_allow_html=True)
-                    mc1,mc2=st.columns([2,5])
-                    mtype=mc1.radio(f"Type",["Video","Image"],horizontal=True,key=f"mtype_{idx}")
-                    if mtype=="Video":
-                        mc3,mc4=mc2.columns([2,4])
-                        src=mc3.selectbox("Source",["PitchBase","TruMedia","Other"],key=f"msrc_{idx}")
-                        url=mc4.text_input("URL",placeholder="https://…",key=f"murl_{idx}")
-                        lbl=mc2.text_input("Label",placeholder="e.g. BB — tell present",key=f"mlbl_{idx}",label_visibility="collapsed")
-                        media_entries.append({"clip_type":"video","source":src,"url":url,"label":lbl,"data":None})
-                    else:
-                        uploaded=mc2.file_uploader("Drag & drop or click to upload image",type=["jpg","jpeg","png","gif"],key=f"mfile_{idx}")
-                        lbl=mc2.text_input("Label",placeholder="e.g. Glove position — tell present",key=f"mimlbl_{idx}",label_visibility="collapsed")
-                        img_data=base64.b64encode(uploaded.read()).decode() if uploaded else None
-                        media_entries.append({"clip_type":"image","source":"upload","url":"","label":lbl,"data":img_data})
-                    st.markdown('</div>',unsafe_allow_html=True)
-
                 c7,c8=st.columns(2)
                 confidence=c7.selectbox("Confidence",["High","Medium","Low"],index=1)
                 games=c8.number_input("Games Sampled",min_value=1,value=1)
                 tags=st.text_input("Tags",placeholder="e.g. video confirmed, men on base")
-
-                cs,ca2=st.columns([3,1])
-                submitted=cs.form_submit_button("Submit for Review",type="primary")
-                add_media=ca2.form_submit_button("+ Add Media")
-
-                if add_media: st.session_state.media_rows.append({"type":"video"}); st.rerun()
+                submitted=st.form_submit_button("Submit for Review",type="primary")
                 if submitted:
                     if not tell.strip(): st.error("Tell description is required.")
                     elif not final_opponent: st.error("Team must be resolved first.")
