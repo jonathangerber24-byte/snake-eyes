@@ -4,3 +4,4 @@ bcrypt
 requests
 reportlab
 psycopg2-binary
+opencv-python-headless
