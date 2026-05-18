@@ -14,19 +14,6 @@ from pathlib import Path
 st.set_page_config(page_title="Snake Eyes // D-backs Pitch Intel",page_icon="⚾",layout="wide",initial_sidebar_state="expanded")
 
 def get_db():
-    # Use Streamlit secrets in production, fallback to SQLite locally
-    try:
-        db_url = st.secrets["DATABASE_URL"]
-        conn = psycopg2.connect(db_url)
-        conn.autocommit = False
-        return conn, "pg"
-    except Exception:
-        import sqlite3
-        conn = sqlite3.connect(str(Path.home() / "snake_eyes.db"))
-        conn.row_factory = sqlite3.Row
-        return conn, "sqlite"
-
-def get_db():
     try:
         db_url = st.secrets["DATABASE_URL"]
         conn = psycopg2.connect(db_url, cursor_factory=psycopg2.extras.RealDictCursor)
@@ -808,7 +795,8 @@ elif page=="add_tip":
                         add_db_tip({"mlb_player_id":selected.get("id"),"name":selected["name"],"jersey_number":selected["jersey"],"hand":selected["hand"],"opponent":final_opponent,"level":final_level,"tip_view":tv,"internal":is_internal,"pitch":pitch,"tell_type":tell_type,"tell":tell.strip(),"vantage":vantage,"confidence":confidence,"games":int(games),"tags":tags,"clips":clips,"status":"pending","submitted_by":user["username"],"submitted_by_display":user["display_name"],"date_added":str(date.today()),"history":[{"date":str(date.today()),"event":f"Tip submitted by {user['display_name']} (MLB ID:{selected.get('id','manual')})"}]})
                         st.session_state.selected_player=None; st.session_state.media_rows=[{"type":"video"}]
                         st.session_state.prefill_level=None; st.session_state.prefill_opponent=None; st.session_state.prefill_internal=False
-                        st.success(f"Tip for {selected['name']} submitted!"); go("queue")
+                        st.session_state["tip_submitted_name"] = selected["name"]
+                        go("tip_submitted")
 
 # ── PITCHER PROFILE ────────────────────────────────────────────────────────────────
 elif page=="pitcher_profile":
@@ -857,6 +845,26 @@ elif page=="pitcher_profile":
     if evts:
         for ev in evts: st.markdown(f'<div class="history-entry"><div class="history-date">{ev["date"]} · {ev["tip_level"]} · {ev["tip_pitch"]}</div><div style="font-size:13px;color:#1a1410;margin-top:2px;">{ev["event"]}</div></div>',unsafe_allow_html=True)
     else: st.markdown('<div style="font-size:12px;color:#9a8a78;">No history entries yet.</div>',unsafe_allow_html=True)
+
+# ── TIP SUBMITTED ────────────────────────────────────────────────────────────────
+elif page=="tip_submitted":
+    pitcher_name = st.session_state.get("tip_submitted_name", "the pitcher")
+    st.markdown(f"""
+    <div style="max-width:500px;margin:80px auto;text-align:center;">
+        <div style="width:64px;height:64px;border-radius:50%;background:#0a3a1822;border:2px solid #2a7840;display:flex;align-items:center;justify-content:center;margin:0 auto 20px;font-size:28px;">✓</div>
+        <div style="font-size:24px;font-weight:600;color:#1a1410;margin-bottom:8px;">Tip Submitted</div>
+        <div style="font-size:14px;color:#7a6a58;font-family:monospace;margin-bottom:6px;">{pitcher_name}</div>
+        <div style="font-size:13px;color:#9a8a78;margin-bottom:32px;">Your tip is pending review by an admin.<br>You'll be able to see it under My Account once approved.</div>
+        <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap;"></div>
+    </div>
+    """, unsafe_allow_html=True)
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Submit Another Tip", type="primary", use_container_width=True):
+            go("add_tip")
+    with c2:
+        if st.button("Go to Home", use_container_width=True):
+            go("home")
 
 # ── QUEUE ─────────────────────────────────────────────────────────────────────────
 elif page=="queue":
