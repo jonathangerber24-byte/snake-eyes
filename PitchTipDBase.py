@@ -149,6 +149,9 @@ def update_db_user(uid,display_name,role,default_level):
 def del_db_user(uid):
     conn,db=get_db(); execute(conn,db,"DELETE FROM users WHERE id=%s",(uid,)); conn.commit(); conn.close()
 
+def del_db_tip(tid):
+    conn,db=get_db(); execute(conn,db,"DELETE FROM tips WHERE id=%s",(tid,)); conn.commit(); conn.close()
+
 def check_db_login(username,password):
     conn,db=get_db(); row=fetchone(conn,db,"SELECT * FROM users WHERE username=%s",(username.lower().strip(),)); conn.close()
     if not row: return None
@@ -648,6 +651,15 @@ elif page=="tip_detail":
             if st.button("Mark Inactive",use_container_width=True,key="inact_det"):
                 hist=tip["history"]+[{"date":str(date.today()),"event":f"Marked inactive by {user['display_name']}"}]
                 update_db_tip(tip["id"],{"status":"inactive","history":hist}); st.info("Marked inactive."); st.rerun()
+        if is_admin():
+            st.markdown("<hr>",unsafe_allow_html=True)
+            st.markdown('<div style="font-size:11px;color:#9a8a78;font-family:monospace;text-transform:uppercase;letter-spacing:.1em;margin-bottom:6px;">Delete Tip</div>',unsafe_allow_html=True)
+            confirm_del = st.checkbox("Confirm permanent deletion", key="confirm_del")
+            if confirm_del:
+                if st.button("Delete Tip", use_container_width=True, key="del_tip"):
+                    del_db_tip(tip["id"])
+                    st.success("Tip deleted.")
+                    go("home")
 
 # ── EDIT TIP ──────────────────────────────────────────────────────────────────────
 elif page=="edit_tip":
